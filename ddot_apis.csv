@@ -1,0 +1,8 @@
+company,api_url
+Bird,https://gbfs.bird.co/dc
+Bolt,https://www.bolt.miami/bolt2/dc/gbfs/en/free_bike_status.json
+Jump,https://gbfs.uber.com/v1/dcs/
+Lime,https://lime.bike/api/partners/v1/gbfs/free_bike_status.json
+Lyft,https://s3.amazonaws.com/lyft-lastmile-production-iad/lbs/dca/free_bike_status.json
+Skip,https://us-central1-waybots-production.cloudfunctions.net/ddotApi-dcFreeBikeStatus
+Spin,https://web.spin.pm/api/gbfs/v1/washington_dc/free_bike_status

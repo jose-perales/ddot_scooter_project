@@ -1,0 +1,256 @@
+---
+title: "ddot_scooter_project"
+author: "Jose Perales"
+date: "September 24, 2019"
+output: html_document
+---
+
+```{r}
+library(jsonlite)
+library(sf)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(tidycensus)
+options(tigris_use_cache = TRUE)
+
+
+# import Vehicle Ownership Info from DC Policy Center article
+# https://github.com/smitty1788/DCPolicyCenter/blob/master/January%202017/Food%20Desert/Data/Vehicle_Availible.xlsx
+# Calculate % of households in Census Block Group with no cars
+
+vehicle_excel <- read_excel("vehicle_availible.xlsx")
+
+vehicleDF <- vehicle_excel %>% 
+  select(GEOID, TOTAL_POP_HOUSEHOLDS, NO_CARS) %>%
+  mutate(P_NO_CARS = NO_CARS/TOTAL_POP_HOUSEHOLDS) %>%
+  select(GEOID, P_NO_CARS)
+
+# Get Median Household Income from Census API by block group
+censusDF <- get_acs(state = "DC",
+                    geography = "block group",
+                    variables = "B19013_001",
+                    geometry = TRUE)
+
+censusDF <- left_join(censusDF, vehicleDF)
+
+```
+
+```{r}
+# Build purrr-safe JSON pull
+safe_fromJSON <- possibly(fromJSON, NA)
+
+# function to parse data from all apis
+getData <- function(x){
+  
+  if("data" %in% names(x)){
+    df <- x$data$bikes
+  }
+  
+  if("bikes" %in% names(x)){
+    df <- x$bikes
+  }
+  
+  
+  df <- df %>% 
+    mutate_all(as.character)
+  
+  if("vehicle_type" %in% colnames(df)){
+    
+    df <- df %>% 
+      select(bike_id, lat, lon, vehicle_type)
+    
+    return(df)
+    
+  } else if("type" %in% colnames(df)){
+    
+    df <- df %>% 
+      select(bike_id, lat, lon, vehicle_type = type)
+    
+    return(df)
+    
+  } else{
+    
+    df <- df %>% 
+      mutate(vehicle_type = "scooter") %>%
+      select(bike_id, lat, lon, vehicle_type)
+    
+    return(df)
+  }
+  
+}
+
+safe_getData <- possibly(getData, NA)
+
+# Get DDOT API data
+
+apiDF <- read.csv("ddot_apis.csv", stringsAsFactors = F) %>%
+  mutate(json = map(api_url, safe_fromJSON)) %>%
+  filter(!is.na(json)) %>%
+  mutate(data = map(json, safe_getData)) %>%
+  filter(!is.na(data)) %>%
+  select(-api_url, -json) %>%
+  unnest()
+
+# Transform scooter data into numeric lat lon, and conform coordinate reference system to Census API's CRS
+
+scooterDF <- apiDF %>%
+  filter(vehicle_type != "bike") %>%
+  mutate(
+    lat = as.numeric(lat),
+    lon = as.numeric(lon)
+  )
+
+scooterDF <- st_as_sf(scooterDF, 
+                      coords = c("lon", "lat"), 
+                      crs = st_crs(censusDF), 
+                      agr = "constant")
+
+scooterDF %>% 
+  st_transform(st_crs(censusDF))
+
+st_crs(scooterDF)
+```
+
+```{r}
+
+joinedDF <- st_join(scooterDF, censusDF)
+
+p_no_cars <- joinedDF %>%
+  filter(!is.na(P_NO_CARS)) %>%
+  pull(P_NO_CARS) %>%
+  median()
+
+```
+
+```{r}
+
+bothDF <- joinedDF %>%
+  filter(
+    estimate < 44995,
+    P_NO_CARS > p_no_cars
+    )
+
+incomeDF <- joinedDF %>%
+  filter(
+    estimate < 44995
+    )
+
+vehicleDF <- joinedDF %>%
+  filter(
+    P_NO_CARS > p_no_cars
+    )
+
+```
+
+```{r}
+
+company_both <- bothDF %>%
+  group_by(company) %>%
+  summarise(scooters_in_low_income_low_car_ownership = n()) %>% 
+  st_drop_geometry()
+
+company_income <- incomeDF %>%
+  group_by(company) %>%
+  summarise(scooters_in_low_income = n()) %>% 
+  st_drop_geometry()
+
+company_vehicle <- vehicleDF %>%
+  group_by(company) %>%
+  summarise(scooters_in_low_car_ownership = n()) %>% 
+  st_drop_geometry()
+
+company_total <- scooterDF %>%
+  group_by(company) %>%
+  summarise(total_scooters = n()) %>% 
+  st_drop_geometry()
+
+
+final <- left_join(left_join(left_join(company_both, company_income), company_vehicle), company_total)
+
+final <- final %>%
+  mutate(
+    `  both  ` = scooters_in_low_income_low_car_ownership/total_scooters,
+    `  income  ` = scooters_in_low_income/total_scooters,
+    `  car ownership  ` = scooters_in_low_car_ownership/total_scooters
+    )
+
+```
+
+```{r}
+
+total <- sum(company_total$total_scooters)
+
+both <- sum(company_both$scooters_in_low_income_low_car_ownership)
+
+vehicle <- sum(company_vehicle$scooters_in_low_car_ownership)
+
+income <- sum(company_income$scooters_in_low_income)
+
+total <- data.frame(company = c("All Companies"),
+                    scooters_in_low_income_low_car_ownership = both,
+                    scooters_in_low_income = income,
+                    scooters_in_low_car_ownership = vehicle,
+                    total_scooters = total)
+
+total <- total %>%
+  mutate(
+    `  both  ` = scooters_in_low_income_low_car_ownership/total_scooters,
+    `  income  ` = scooters_in_low_income/total_scooters,
+    `  car ownership  ` = scooters_in_low_car_ownership/total_scooters
+    )
+
+final <- bind_rows(final, total)
+
+write.csv(final, "scooter_data_results.csv", row.names = F)
+
+```
+
+```{r}
+
+library(ggrepel)
+library(scales)
+library(viridis)
+
+plotDF <- final %>%
+  select(company, `  both  `, `  income  `, `  car ownership  `) %>%
+  gather(-company, key = "Var", value = "Value") 
+
+plotDF$Var <- factor(plotDF$Var, levels = c("  car ownership  ", "  income  ", "  both  "))
+
+plot <- ggplot(plotDF, aes(x = Var, y = Value, label = percent(round(Value,3)), fill = Var))
+
+plot <- plot + geom_text(vjust = -.25, size = 3)
+
+plot <- plot + geom_bar(stat='identity')
+
+plot <- plot + scale_fill_viridis(discrete = T, direction = -1)
+
+plot <- plot + facet_grid(~company)
+
+plot <- plot + ylim(0, .7)
+
+plot <- plot + labs(title = "% of Scooters in DC Census Block Groups with low income, low car ownership, or both")
+
+plot <- plot + theme(plot.title = element_text(hjust = 0),
+                     strip.background = element_rect(fill="whitesmoke", color = "black"),
+                     panel.background = element_rect(fill = "white", color = "black"),
+                     panel.grid.minor.y = element_blank(),
+                     panel.grid.major.y = element_blank(),
+                     panel.grid.minor.x = element_blank(),
+                     panel.grid.major.x = element_blank(),
+                     panel.border = element_rect(fill = NA, color = "black", size = .5),
+                     legend.position = "bottom",
+                     legend.title = element_blank(),
+                     axis.title = element_blank(),
+                     axis.ticks = element_blank(),
+                     axis.text = element_blank())
+
+
+plot
+
+ggsave("ddot_scooter_viz.png", width = 10, height = 4, units = "in", dpi = 400)
+```
+
+
+
